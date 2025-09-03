@@ -1,0 +1,27 @@
+project: "simulate_regression_v1"
+seed: 1337
+
+data:
+  pt_path: "data/01_simulate/packaged/trainset_simulated.pt"
+  val_pt_path: ""    # Not needed, split dynamically
+
+train:
+  batch_size: 64
+  epochs: 100
+  lr: 1e-3
+  min_lr: 1e-6        # NEW: cosine schedule min
+  weight_decay: 1e-4
+  num_workers: 4
+  grad_clip: 2.0
+  val_ratio: 0.2
+
+model:
+  backbone: "convnextv2_tiny"
+  pretrained: false
+
+output:
+  root: "models/checkpoints"
+  save_best: true
+  monitor: "val_loss"
+  save_every: 0
+  run_tag: ""

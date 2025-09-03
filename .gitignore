@@ -1,0 +1,4 @@
+.venv/
+/data/01_simulate/frames_test/
+/data/01_simulate/frames_train/
+/data/01_simulate/packaged/

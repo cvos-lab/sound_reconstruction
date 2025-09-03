@@ -1,0 +1,47 @@
+project: simulate_v1
+seed: 1337
+
+audio:
+  folder: "data/raw_audio"
+  train_files: ["Audio_inwaves.wav", "Audio_great-now-weve-got-time-to-party.mp3", "Audio_FurElise_Original_6s.wav"]
+  holdout_files: ["Audio_beethoven.wav", "Audio_Geico_Original_4s.wav", "Audio_graduation.wav", "Audio_lalaland.wav", "Audio_mozarts15a_Original_9s.wav", "Audio_not-a-dream-whats-happening-to-place.mp3", "Audio_Sym40_Original_6s.wav"]
+  norm: "rms-20db"
+  # NEW: optionally trim specific files
+  trim:
+    apply_to: ["Audio_inwaves.wav"]   # any subset of train_files
+    fraction: 0.5                     # keep first 50% (0 < fraction <= 1)
+
+simulation:
+  canonical_sr: 4800         # training sample rate
+  frame_size: [128, 128]     # (H, W) output frame size
+  pattern_folder: "data/raw_pattern"
+  pattern_mode: "fixed"
+  pattern_file: "speckle.bmp"
+  magnification: 10.0
+
+  calibration:
+    alpha: -1.4458188899075647e+03
+    beta:  -1.4446376953530689e+03
+    gamma: -1.0322752235572110e+00
+    u0:    2.2464793467423874e+02
+    v0:    1.7895763645710602e+02
+    R: [ [ 9.9983911887424237e-01,  1.7848362129595435e-02, -1.7811058557933288e-03],
+         [-1.7829189266673460e-02,  9.9978845369268321e-01,  1.0255138852622416e-02],
+         [ 1.9637665013574530e-03, -1.0221733320932092e-02,  9.9994582842724233e-01] ]
+    T: [ -8.8173675415097435e+01, -4.5772010598692937e+01, -1.2899667451947814e+03 ]
+
+reconstruction:
+  recon_sr_list: [500, 1000, 2000, 4800, 10000]   # used after training
+
+output:
+  root: "data/01_simulate"
+  canonical_dir: "sr{sr}"     # e.g., sr4800
+  debug_frames: true          # save a few PNGs per audio to inspect geometry
+  packaged: "packaged"        # where .pt is saved
+
+packaging:
+  splits:
+    mode: "per_source"        # 80/20 inside EACH source (for future step)
+    train_ratio: 0.8
+    val_ratio: 0.2
+    seed: 1337
