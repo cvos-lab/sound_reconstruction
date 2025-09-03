@@ -1,0 +1,3 @@
+file 'C:/Users/LabG34-02/Desktop/2019_AudioReconstruction_CNN/#Audio_label/bee_3s.wav'
+file 'C:/Users/LabG34-02/Desktop/2019_AudioReconstruction_CNN/#Audio_label/Fur_3s.wav'
+file 'C:/Users/LabG34-02/Desktop/2019_AudioReconstruction_CNN/#Audio_label/moz_3s.wav'

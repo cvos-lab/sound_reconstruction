@@ -1,0 +1,5 @@
+combine: ffmpeg -f concat -safe 0 -i ffmpeg_list.txt -c copy out.wav
+
+silent: ffmpeg -f lavfi -i "aevalsrc=0|0:d=1" silent_1s.wav
+
+cut: ffmpeg -ss 0 -t 3 -i input.mp3 output.mp3
