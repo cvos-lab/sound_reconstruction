@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 
 # ---- Max reproducibility: set BEFORE torch import ----
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
@@ -16,51 +17,64 @@ def seed_everything(seed=1337):
     torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True, warn_only=True)
 
-# ---- Set seed ASAP for all libraries ----
 seed = 1337
 seed_everything(seed)
 
-# --- Usual imports ---
 import yaml
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 import torch.nn as nn
 from models.convnextv2_tiny import ConvNeXtV2TinyRegressor
 from pathlib import Path
 from tqdm import tqdm
-from datetime import datetime
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scripts.io_utils import get_gpu_temperatures
 
-# ---- GPU temperature helper ----
-def get_gpu_temperature():
-    """Returns the temperature (°C) of the first available GPU, or None if not available."""
-    try:
-        import pynvml
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-        pynvml.nvmlShutdown()
-        return temp
-    except Exception:
-        return None
-
-# ---- YAML loader ----
 def load_yaml(path):
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
-# ---- Dataset ----
+# =========================================================
+# Dataset keeps per-clip structure + ranges (for no-leakage)
+# =========================================================
 class FrameToAudioDataset(Dataset):
+    """
+    Loads a packaged .pt where frames/audio are stored as lists per clip.
+    Exposes flattened tensors for __getitem__, and also keeps per-clip
+    lengths/ranges so we can split by clip (no leakage).
+    """
     def __init__(self, pt_path):
         pkg = torch.load(pt_path, map_location="cpu")
-        self.frames = torch.cat(pkg["frames_list"], dim=0).float() / 255.0  # [N,128,128]
-        self.audios = torch.cat([a.view(-1) for a in pkg["audio_list"]], dim=0)  # [N]
-        self.N = self.frames.shape[0]
+
+        # Keep per-clip lists (uint8 frames in [0..255], audio float)
+        self.frames_list = [f.float() / 255.0 for f in pkg["frames_list"]]  # list of [T_i, H, W]
+        self.audios_list = [a.view(-1)         for a in pkg["audio_list"]]   # list of [T_i]
+
+        # Per-clip lengths and global offsets
+        self.clip_lengths = [int(f.shape[0]) for f in self.frames_list]
+        self.offsets = np.cumsum([0] + self.clip_lengths[:-1]).astype(int)  # [0, T1, T1+T2, ...]
+
+        # Flatten for normal __getitem__
+        self.frames = torch.cat(self.frames_list, dim=0)  # [sum T_i, H, W]
+        self.audios = torch.cat(self.audios_list, dim=0)  # [sum T_i]
+        self.N = int(self.frames.shape[0])
+
     def __len__(self):
         return self.N
-    def __getitem__(self, idx):
-        return self.frames[idx][None, ...], self.audios[idx]  # [1,128,128], float32
 
-# ---- Metrics ----
+    def __getitem__(self, idx):
+        return self.frames[idx][None, ...], self.audios[idx]
+
+    def get_clip_ranges(self):
+        """
+        Returns list of (start_idx, end_idx) for each clip in the flattened view.
+        """
+        ranges = []
+        for off, L in zip(self.offsets, self.clip_lengths):
+            ranges.append((int(off), int(off + L)))
+        return ranges
+
 def compute_mae(pred, target):
     return (pred - target).abs().mean().item()
 
@@ -68,7 +82,7 @@ def compute_r2(pred, target):
     target_mean = target.mean()
     ss_tot = ((target - target_mean) ** 2).sum()
     ss_res = ((target - pred) ** 2).sum()
-    return 1 - (ss_res / (ss_tot + 1e-8))
+    return float(1 - (ss_res / (ss_tot + 1e-8)))
 
 def compute_snr_db(pred, target):
     signal_power = (target ** 2).mean()
@@ -76,20 +90,28 @@ def compute_snr_db(pred, target):
     snr = 10 * torch.log10(signal_power / noise_power)
     return snr.item()
 
-# ---- Loss curve plotter ----
 def plot_losses(train_losses, val_losses, best_epoch, best_val_loss, ckpt_dir, model_name="convnextv2_tiny"):
-    plt.figure()
-    plt.plot(train_losses, label="Train MSE")
-    plt.plot(val_losses, label="Val MSE")
-    plt.xlabel("Epoch")
-    plt.ylabel("MSE Loss")
-    plt.title(f"{model_name.upper()} Loss Curve (Audio Regression)")
-    plt.legend()
-    plt.grid(True)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(train_losses, label="Train MSE")
+    ax.plot(val_losses, label="Val MSE")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE Loss")
+    ax.set_title(f"{model_name.upper()} Loss Curve (Audio Regression)")
+    ax.legend()
+    ax.grid(True)
+
+    # ---- Zoom around validation losses with extra padding ----
+    val_min = float(min(val_losses))
+    val_max = float(max(val_losses))
+    margin = (val_max - val_min) * 0.5  # larger padding
+    if margin == 0:                       # handle perfectly flat curves
+        margin = max(val_max, 1e-8) * 0.1
+    ax.set_ylim(val_min - margin, val_max + margin)
+
     if best_epoch >= 0:
-        ymin, ymax = plt.gca().get_ylim()
+        ymin, ymax = ax.get_ylim()
         y_offset = (ymax - ymin) * 0.05
-        plt.annotate(
+        ax.annotate(
             f"{best_val_loss:.6f}",
             xy=(best_epoch, best_val_loss),
             xytext=(best_epoch, best_val_loss + y_offset),
@@ -99,97 +121,197 @@ def plot_losses(train_losses, val_losses, best_epoch, best_val_loss, ckpt_dir, m
             weight="bold",
             ha="center"
         )
-    lossplot_name = f"{model_name}_loss.png"
-    plt.savefig(os.path.join(ckpt_dir, lossplot_name))
-    plt.close()
 
-# ---- Training/Validation Loops ----
-def run_epoch(model, loader, loss_fn, optimizer, device, is_train=True, grad_clip=0.0):
+    # ---- Save instead of show ----
+    os.makedirs(ckpt_dir, exist_ok=True)
+    save_path = os.path.join(ckpt_dir, f"{model_name.lower()}_loss.png")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return save_path
+
+# --------------------------------------------
+# Target-scaling aware training/validation step
+# --------------------------------------------
+def run_epoch(model, loader, loss_fn, optimizer, device,
+              is_train=True, grad_clip=0.0,
+              mu=None, std=None, use_target_scaling=False):
+    """
+    If use_target_scaling: compute loss on normalized targets/preds.
+    Metrics are computed on *denormalized* predictions for readability.
+    """
     model.train() if is_train else model.eval()
     total_loss, total_mae, total_r2, total_snr = 0.0, 0.0, 0.0, 0.0
     count = 0
-    loop = tqdm(loader, disable=not is_train, desc="Train" if is_train else "Val")
+    loop = tqdm(loader, disable=not is_train, desc="Train" if is_train else "Val", ncols=150)
+
     for x, y in loop:
         x = x.to(device)
         y = y.to(device)
+
         with torch.set_grad_enabled(is_train):
-            y_pred = model(x).squeeze()
-            loss = loss_fn(y_pred, y)
+            if use_target_scaling:
+                y_n = (y - mu) / std
+                y_pred_n = model(x).squeeze()
+                loss = loss_fn(y_pred_n, y_n)
+                y_pred = y_pred_n * std + mu  # for metrics
+            else:
+                y_pred = model(x).squeeze()
+                loss = loss_fn(y_pred, y)
+
             mae = compute_mae(y_pred, y)
             r2 = compute_r2(y_pred, y)
             snr = compute_snr_db(y_pred, y)
+
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
                 if grad_clip and grad_clip > 0:
                     nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
-            total_loss += loss.item() * x.size(0)
-            total_mae += mae * x.size(0)
-            total_r2  += r2 * x.size(0)
-            total_snr += snr * x.size(0)
-            count += x.size(0)
+
+            bsz = x.size(0)
+            total_loss += loss.item() * bsz
+            total_mae  += mae * bsz
+            total_r2   += r2 * bsz
+            total_snr  += snr * bsz
+            count      += bsz
+
+            loop.set_postfix(loss=f"{loss.item():.6f}", mae=f"{mae:.6f}", r2=f"{r2:.5f}", snr=f"{snr:.4f}dB")
+
     avg_loss = total_loss / count
-    avg_mae = total_mae / count
-    avg_r2  = total_r2 / count
-    avg_snr = total_snr / count
+    avg_mae  = total_mae  / count
+    avg_r2   = total_r2   / count
+    avg_snr  = total_snr  / count
     return avg_loss, avg_mae, avg_r2, avg_snr
 
-# ---- Main ----
 def main():
-    # --- Config, device, seeds
-    cfg = load_yaml("configs/train_regression.yaml")
+    cfg = load_yaml("configs/regression_simulate.yaml")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- Dataset and Split
-    ds = FrameToAudioDataset(cfg["data"]["pt_path"])
-    n_total = len(ds)
-    n_val = int(cfg["train"].get("val_ratio", 0.2) * n_total)
-    n_train = n_total - n_val
-    g = torch.Generator().manual_seed(cfg["seed"])
-    train_ds, val_ds = random_split(ds, [n_train, n_val], generator=g)
-    train_loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"], shuffle=True, num_workers=cfg["train"]["num_workers"])
-    val_loader   = DataLoader(val_ds, batch_size=cfg["train"]["batch_size"], shuffle=False, num_workers=cfg["train"]["num_workers"])
+    # ---- Flexible experiment type ("simulate" or "practical") ----
+    experiment_type = cfg.get("experiment_type", "simulate")  # e.g. "simulate" or "practical"
+    run_date = datetime.now().strftime("%Y%m%d")
+    run_tag = cfg["output"].get("run_tag", "") or run_date
+    model_name = cfg["model"]["backbone"]
 
-    # --- Model
+    # ---- Folder: checkpoints/simulate/convnextv2_tiny_YYYYMMDD/
+    ckpt_dir = Path(cfg["output"]["root"]) / experiment_type / f"{model_name}_{run_tag}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"===> Saving all checkpoints/logs to: {ckpt_dir}")
+
+    # =========================================================
+    # Dataset + group-wise split by clip (no leakage)
+    # =========================================================
+    ds = FrameToAudioDataset(cfg["data"]["pt_path"])
+    clip_ranges = ds.get_clip_ranges()                     # [(s0,e0), (s1,e1), ...]
+    num_clips = len(clip_ranges)
+    total_frames = sum(e - s for (s, e) in clip_ranges)
+
+    val_ratio = float(cfg["train"].get("val_ratio", 0.2))
+    target_val_frames = int(round(total_frames * val_ratio))
+
+    # reproducible shuffle of clip ids
+    g = torch.Generator().manual_seed(cfg["seed"])
+    perm = torch.randperm(num_clips, generator=g).tolist()
+
+    # take whole clips into val until we reach ~target frames
+    val_clip_ids, acc = [], 0
+    for ci in perm:
+        s, e = clip_ranges[ci]
+        val_clip_ids.append(ci)
+        acc += (e - s)
+        if acc >= target_val_frames:
+            break
+    val_clip_ids = set(val_clip_ids)
+
+    # expand to frame indices
+    train_indices, val_indices = [], []
+    for ci, (s, e) in enumerate(clip_ranges):
+        if ci in val_clip_ids:
+            val_indices.extend(range(s, e))
+        else:
+            train_indices.extend(range(s, e))
+
+    # sanity checks
+    assert set(train_indices).isdisjoint(set(val_indices)), "Leakage: frame index overlap!"
+    print(f"Split: {len(train_indices)} train frames | {len(val_indices)} val frames "
+          f"({len(val_indices) / (len(train_indices)+len(val_indices)):.1%} val) "
+          f"from {num_clips} clips (val clips: {len(val_clip_ids)})")
+
+    train_ds = Subset(ds, train_indices)
+    val_ds   = Subset(ds, val_indices)
+
+    pin_mem = device.type == "cuda"
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=cfg["train"]["num_workers"],
+        pin_memory=pin_mem,
+    )
+    val_loader   = DataLoader(
+        val_ds,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=False,
+        num_workers=cfg["train"]["num_workers"],
+        pin_memory=pin_mem,
+    )
+
+    # -----------------------------------
+    # (6) Compute target scaling (mu, std)
+    # -----------------------------------
+    with torch.no_grad():
+        y_train = ds.audios[train_indices]  # 1D tensor of training targets
+        mu  = y_train.mean().item()
+        std = float(y_train.std().clamp_min(1e-8))
+    print(f"[Scaler] mu={mu:.6e}  std={std:.6e}  (computed on training set only)")
+
+    # --- Model (7) with improved MLP head (see models file)
     model = ConvNeXtV2TinyRegressor(pretrained=cfg["model"]["pretrained"])
     model.to(device)
     loss_fn = nn.MSELoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
+
+    lr = float(cfg["train"]["lr"])
+    min_lr = float(cfg["train"]["min_lr"])
+    weight_decay = float(cfg["train"]["weight_decay"])
+    epochs = int(cfg["train"]["epochs"])
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg["train"]["epochs"], eta_min=cfg["train"]["min_lr"]
+        optimizer, T_max=epochs, eta_min=min_lr
     )
 
-    # --- Output/checkpoints
-    dt_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tag = cfg["output"].get("run_tag", "") or dt_str
-    ckpt_dir = Path(cfg["output"]["root"]) / f"{cfg['model']['backbone']}_{tag}"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
     best_epoch = -1
     train_losses, val_losses = [], []
 
-    # --- Training Loop
     for epoch in range(cfg["train"]["epochs"]):
         print(f"\n=== Epoch {epoch+1}/{cfg['train']['epochs']} ===")
-        lr = optimizer.param_groups[0]['lr']
-        print(f"LR: {lr:.2e}")
+        lr_now = optimizer.param_groups[0]['lr']
+        print(f"LR: {lr_now:.2e}")
 
         # ---- Show GPU temperature
-        gpu_temp = get_gpu_temperature()
-        if gpu_temp is not None:
-            print(f"🌡️ GPU Temp: {gpu_temp}°C")
+        temps = get_gpu_temperatures()
+        if temps:
+            text = " | ".join([f"GPU{i}: {t}°C" for i, t in temps])
+            print(f"🌡️ {text}")
+        else:
+            print("🌡️ GPU temp not available (CPU run / NVML not found / nvidia-smi missing)")
 
         train_loss, train_mae, train_r2, train_snr = run_epoch(
             model, train_loader, loss_fn, optimizer, device,
-            is_train=True, grad_clip=cfg["train"].get("grad_clip", 0)
+            is_train=True, grad_clip=cfg["train"].get("grad_clip", 0),
+            mu=mu, std=std, use_target_scaling=True
         )
         val_loss, val_mae, val_r2, val_snr = run_epoch(
-            model, val_loader, loss_fn, optimizer, device, is_train=False
+            model, val_loader, loss_fn, optimizer, device, is_train=False,
+            mu=mu, std=std, use_target_scaling=True
         )
 
-        print(f"[Train] MSE: {train_loss:.5f} | MAE: {train_mae:.5f} | R2: {train_r2:.4f} | SNR: {train_snr:.2f} dB")
-        print(f"[ Val ] MSE: {val_loss:.5f} | MAE: {val_mae:.5f} | R2: {val_r2:.4f} | SNR: {val_snr:.2f} dB")
+        print(f"[Train] MSE: {train_loss:.6f} | MAE: {train_mae:.6f} | R2: {train_r2:.5f} | SNR: {train_snr:.5f} dB")
+        print(f"[ Val ] MSE: {val_loss:.6f} | MAE: {val_mae:.6f} | R2: {val_r2:.5f} | SNR: {val_snr:.5f} dB")
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -201,16 +323,30 @@ def main():
             best_loss = val_loss
             best_epoch = epoch
             ckpt_path = ckpt_dir / f"best.pt"
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"[OK] Saved best model to {ckpt_path}")
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)  # Defensive
+            torch.save({
+                "model": model.state_dict(),
+                "mu": mu, "std": std,                 # save scaler for inference
+                "cfg": cfg,
+                "epoch": epoch,
+                "val_loss": val_loss,
+            }, ckpt_path)
+            print(f"[OK] Saved best model+scaler to {ckpt_path}")
 
         # Save every N epochs
         save_every = cfg["output"].get("save_every", 0)
         if save_every > 0 and (epoch + 1) % save_every == 0:
-            torch.save(model.state_dict(), ckpt_dir / f"epoch{epoch+1}.pt")
-            print(f"[OK] Saved model at epoch {epoch+1}")
+            ckpt_path = ckpt_dir / f"epoch{epoch+1}.pt"
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "model": model.state_dict(),
+                "mu": mu, "std": std,
+                "cfg": cfg,
+                "epoch": epoch+1,
+                "val_loss": val_loss,
+            }, ckpt_path)
+            print(f"[OK] Saved model+scaler at epoch {epoch+1}")
 
-    # ---- Plot and save the loss curve
     plot_losses(train_losses, val_losses, best_epoch, best_loss, str(ckpt_dir), model_name=cfg["model"]["backbone"])
     print(f"\n[Done] Training finished. Best val_loss: {best_loss:.5f} at epoch {best_epoch+1}")
 

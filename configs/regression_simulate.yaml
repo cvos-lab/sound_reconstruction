@@ -2,11 +2,11 @@ project: "simulate_regression_v1"
 seed: 1337
 
 data:
-  pt_path: "data/01_simulate/packaged/trainset_simulated.pt"
+  pt_path: "data/01_simulate/packaged/trainset_simulated_4800.pt"
   val_pt_path: ""    # Not needed, split dynamically
 
 train:
-  batch_size: 64
+  batch_size: 32
   epochs: 100
   lr: 1e-3
   min_lr: 1e-6        # NEW: cosine schedule min
@@ -24,4 +24,7 @@ output:
   save_best: true
   monitor: "val_loss"
   save_every: 0
-  run_tag: ""
+  run_tag: ""    # if blank, will use YYYYMMDD
+
+# NEW: Experiment type for subfolder naming!
+experiment_type: "simulate"

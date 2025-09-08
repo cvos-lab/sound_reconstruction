@@ -6,30 +6,34 @@ import timm
 
 class ConvNeXtV2TinyRegressor(nn.Module):
     """
-    ConvNeXtV2-tiny backbone (single-channel input) + custom regression head.
-    Suitable for 128x128 grayscale images as input, outputs a single value per image.
+    ConvNeXtV2-tiny backbone (single-channel input) + improved regression head.
+    Suitable for ~128x128 grayscale images; outputs one scalar per image.
     """
     def __init__(self, pretrained=False, in_chans=1):
         super().__init__()
-        # Create ConvNeXtV2-tiny backbone
+        # Backbone
         self.backbone = timm.create_model(
             'convnextv2_tiny.fcmae',
             pretrained=pretrained,
             in_chans=in_chans,
-            num_classes=0,     # removes default classification head
-            global_pool='avg'  # get [B, C] after backbone
+            num_classes=0,     # remove default classification head
+            global_pool='avg'  # [B, C]
         )
-        # Regression head: outputs scalar per image (B,1)
-        self.head = nn.Linear(self.backbone.num_features, 1)
+        # (7) Stronger head for stability
+        self.head = nn.Sequential(
+            nn.LayerNorm(self.backbone.num_features),
+            nn.Linear(self.backbone.num_features, 256),
+            nn.GELU(),
+            nn.Linear(256, 1),
+        )
 
     def forward(self, x):
-        # x: [B, 1, 128, 128]  (batch of grayscale images)
-        features = self.backbone(x)  # [B, C]
-        out = self.head(features)    # [B, 1]
-        return out.squeeze(-1)       # [B]
+        # x: [B, in_chans, H, W]
+        features = self.backbone(x)   # [B, C]
+        out = self.head(features)     # [B, 1]
+        return out.squeeze(-1)        # [B]
 
 if __name__ == "__main__":
-    # Demo/test: check input/output shapes
     net = ConvNeXtV2TinyRegressor(pretrained=False)
     dummy = torch.randn(8, 1, 128, 128)
     out = net(dummy)
